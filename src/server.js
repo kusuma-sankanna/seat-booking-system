@@ -1,7 +1,8 @@
 const express = require('express');
 const pool = require('./db');
 require('dotenv').config();
- const redis = require('./redis');
+const redis = require('./redis');
+const emailQueue = require('./queue');
 
 const app = express();
 app.use(express.json());
@@ -92,6 +93,14 @@ app.post('/shows/:showId/book', async (req, res) => {
     // after successful booking creation, inside the same handler:
     await redis.set(`booking:hold:${bookingId}`, '1', 'EX', 600); // 10 minutes
 
+    // after successful booking,
+    await emailQueue.add('send-confirmation', {
+      bookingId,
+      userId,
+      showId,
+      seats: seatLabels
+    });
+
     res.status(201).json({ bookingId, showId, seats: seatLabels, status: 'pending' });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -153,6 +162,14 @@ app.post('/shows/:showId/book-optimistic', async (req, res) => {
 
     // after successful booking creation, inside the same handler:
     await redis.set(`booking:hold:${bookingId}`, '1', 'EX', 600); // 10 minutes
+
+    // after successful booking,
+    await emailQueue.add('send-confirmation', {
+      bookingId,
+      userId,
+      showId,
+      seats: seatLabels
+    });
 
     res.status(201).json({ bookingId, showId, seats: seatLabels, status: 'pending' });
   } catch (err) {
