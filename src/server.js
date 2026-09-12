@@ -1,6 +1,7 @@
 const express = require('express');
 const pool = require('./db');
 require('dotenv').config();
+ const redis = require('./redis');
 
 const app = express();
 app.use(express.json());
@@ -88,6 +89,9 @@ app.post('/shows/:showId/book', async (req, res) => {
 
     await client.query('COMMIT'); // everything succeeded — make it permanent
 
+    // after successful booking creation, inside the same handler:
+    await redis.set(`booking:hold:${bookingId}`, '1', 'EX', 600); // 10 minutes
+
     res.status(201).json({ bookingId, showId, seats: seatLabels, status: 'pending' });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -147,10 +151,55 @@ app.post('/shows/:showId/book-optimistic', async (req, res) => {
       }
     }
 
+    // after successful booking creation, inside the same handler:
+    await redis.set(`booking:hold:${bookingId}`, '1', 'EX', 600); // 10 minutes
+
     res.status(201).json({ bookingId, showId, seats: seatLabels, status: 'pending' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong' });
+  }
+});
+
+const cron = require('node-cron');
+
+cron.schedule('*/1 * * * *', async () => {
+  console.log('Running booking expiry sweep...');
+
+  try {
+    const staleBookings = await pool.query(
+      `SELECT id FROM bookings
+       WHERE status = 'pending'
+       AND created_at < NOW() - INTERVAL '10 minutes'`
+    );
+
+    for (const booking of staleBookings.rows) {
+      const holdExists = await redis.exists(`booking:hold:${booking.id}`);
+
+      if (!holdExists) {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query(
+            `UPDATE show_seats SET status = 'available', booking_id = NULL WHERE booking_id = $1`,
+            [booking.id]
+          );
+          await client.query(
+            `UPDATE bookings SET status = 'expired' WHERE id = $1`,
+            [booking.id]
+          );
+          await client.query('COMMIT');
+          console.log(`Expired booking ${booking.id}, released its seats`);
+        } catch (err) {
+          await client.query('ROLLBACK');
+          console.error(`Failed to expire booking ${booking.id}:`, err);
+        } finally {
+          client.release();
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Expiry sweep failed:', err);
   }
 });
 
