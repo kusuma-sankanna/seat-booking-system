@@ -3,9 +3,14 @@ const pool = require('./db');
 require('dotenv').config();
 const redis = require('./redis');
 const emailQueue = require('./queue');
+const crypto = require('crypto');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 const PORT = process.env.PORT || 3000;
 
 // List all shows
@@ -217,6 +222,91 @@ cron.schedule('*/1 * * * *', async () => {
     }
   } catch (err) {
     console.error('Expiry sweep failed:', err);
+  }
+});
+
+
+//Payment-initiation endpoint
+app.post('/bookings/:bookingId/pay', async (req, res) => {
+  const { bookingId } = req.params;
+
+  try {
+    const bookingCheck = await pool.query('SELECT * FROM bookings WHERE id = $1', [bookingId]);
+    if (bookingCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+    if (bookingCheck.rows[0].status !== 'pending') {
+      return res.status(409).json({ error: `Booking is already ${bookingCheck.rows[0].status}` });
+    }
+
+    // In a real integration, this is where you'd call the actual payment gateway's API
+    const paymentIntentId = `pi_${crypto.randomBytes(8).toString('hex')}`;
+
+    res.json({
+      bookingId,
+      paymentIntentId,
+      message: 'Payment initiated. Awaiting webhook confirmation.'
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong' });
+  }
+});
+
+//Webhook Endpoint
+app.post('/webhooks/payment', async (req, res) => {
+  const signature = req.headers['x-webhook-signature'];
+  const payload = req.rawBody;
+
+  const expectedSignature = crypto
+    .createHmac('sha256', process.env.WEBHOOK_SECRET)
+    .update(payload)
+    .digest('hex');
+
+  const isValid = crypto.timingSafeEqual(
+    Buffer.from(signature, 'hex'),
+    Buffer.from(expectedSignature, 'hex')
+  );
+
+  if (!isValid) {
+    return res.status(401).json({ error: 'Invalid signature' });
+  }
+
+  const { eventId, bookingId, status } = req.body;
+
+  try {
+    await pool.query(
+      'INSERT INTO processed_webhook_events (event_id) VALUES ($1)',
+      [eventId]
+    );
+  } catch (err) {
+    if (err.code === '23505') {
+      console.log(`Duplicate webhook event ${eventId} — already processed, skipping`);
+      return res.status(200).json({ message: 'Already processed' });
+    }
+    throw err;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (status === 'success') {
+      await client.query(`UPDATE bookings SET status = 'confirmed' WHERE id = $1`, [bookingId]);
+      await emailQueue.add('send-confirmation', { bookingId });
+    } else if (status === 'failed') {
+      await client.query(`UPDATE show_seats SET status = 'available', booking_id = NULL WHERE booking_id = $1`, [bookingId]);
+      await client.query(`UPDATE bookings SET status = 'payment_failed' WHERE id = $1`, [bookingId]);
+    }
+
+    await client.query('COMMIT');
+    res.status(200).json({ message: 'Webhook processed' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Processing failed' });
+  } finally {
+    client.release();
   }
 });
 
