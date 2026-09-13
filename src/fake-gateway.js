@@ -1,4 +1,4 @@
-const http = require('http');
+const http = require('https');
 const crypto = require('crypto');
 require('dotenv').config();
 
@@ -14,8 +14,8 @@ function sendWebhook(payload) {
       .digest('hex');
 
     const req = http.request({
-      hostname: 'localhost',
-      port: 3000,
+      hostname: 'seat-booking-system-0tx3.onrender.com',
+      port: 443,
       path: '/webhooks/payment',
       method: 'POST',
       headers: {
